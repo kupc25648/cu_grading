@@ -34,12 +34,12 @@ html, body, [class*="css"] {
 # =========================================================
 
 st.set_page_config(
-    page_title="ArchGrade Studio V2",
+    page_title="ArchGrade",
     page_icon="🎓",
     layout="wide"
 )
 
-st.title("🎓 ArchGrade Studio V3 — Professor Visual Review")
+st.title("🎓 ArchGrade — Professor Visual Review")
 st.caption("ปรับเกณฑ์ → ดูกราฟทันที → ตรวจตารางด้านล่าง")
 
 st.markdown(
@@ -552,6 +552,35 @@ def assign_by_threshold(value, thresholds):
     return thresholds[-1][0]
 
 
+def excel_geomean(series):
+    """Excel GEOMEAN-style central score. GEOMEAN uses positive values only."""
+    s = pd.to_numeric(series, errors="coerce").dropna()
+    s = s[s > 0]
+    if len(s) == 0:
+        return np.nan
+    return float(np.exp(np.mean(np.log(s))))
+
+
+def excel_quartile_exc(series, quart):
+    """Excel QUARTILE.EXC(array, quart) equivalent for quart = 1, 2, 3."""
+    s = pd.to_numeric(series, errors="coerce").dropna().sort_values().to_numpy(dtype=float)
+    n = len(s)
+    if n == 0:
+        return np.nan
+    p = quart / 4.0
+    pos = p * (n + 1)
+    if pos < 1 or pos > n:
+        return np.nan
+    lo = int(np.floor(pos))
+    hi = int(np.ceil(pos))
+    if lo == hi:
+        return float(s[lo - 1])
+    lo_val = s[lo - 1]
+    hi_val = s[hi - 1]
+    frac = pos - lo
+    return float(lo_val + frac * (hi_val - lo_val))
+
+
 # =========================================================
 # VISUALIZATION HELPERS
 # =========================================================
@@ -571,13 +600,13 @@ def distribution_plot(df, score_col="score_4", title="Score distribution", bound
         title=title,
     )
 
-    mean = plot_df[score_col].mean()
+    mean = round_for_cell_assignment(excel_geomean(plot_df[score_col]), 3)
     std = plot_df[score_col].std(ddof=0)
-    q1 = plot_df[score_col].quantile(0.25)
-    q2 = plot_df[score_col].quantile(0.50)
-    q3 = plot_df[score_col].quantile(0.75)
+    q1 = excel_quartile_exc(plot_df[score_col], 1)
+    q2 = excel_quartile_exc(plot_df[score_col], 2)
+    q3 = excel_quartile_exc(plot_df[score_col], 3)
 
-    fig.add_vline(x=mean, line_dash="solid", line_color="#facc15", annotation_text="Mean", annotation_position="top")
+    fig.add_vline(x=mean, line_dash="solid", line_color="#facc15", annotation_text="Central (GEOMEAN)", annotation_position="top")
     fig.add_vline(x=q1, line_dash="dot", line_color="#94a3b8", annotation_text="Q1", annotation_position="top left")
     fig.add_vline(x=q2, line_dash="dot", line_color="#94a3b8", annotation_text="Q2", annotation_position="top")
     fig.add_vline(x=q3, line_dash="dot", line_color="#94a3b8", annotation_text="Q3", annotation_position="top right")
@@ -671,32 +700,109 @@ def simple_range_grading(df_all, scheme_name, thresholds):
 # =========================================================
 
 def make_score_cells(cell_width=0.025, min_score=0.0, max_score=4.0):
-    # Creates descending cells: 4.000–3.975, 3.975–3.950, ...
-    edges = np.arange(max_score, min_score - cell_width, -cell_width)
-    if edges[-1] > min_score:
-        edges = np.append(edges, min_score)
+    """
+    Create descending score cells using full float64 precision.
+
+    Important: do NOT round upper/lower values during calculation.
+    Rounding is only used when displaying values in the UI. This prevents
+    students exactly on a boundary from being moved to the wrong cell.
+    """
+    cell_width = float(cell_width)
+    min_score = float(min_score)
+    max_score = float(max_score)
+
+    if cell_width <= 0 or max_score <= min_score:
+        return pd.DataFrame(columns=["cell_id", "upper", "lower", "mid"])
+
+    eps = 1e-12
+    span = max_score - min_score
+    n_steps = int(np.floor(span / cell_width + eps))
+
+    edges = [max_score - i * cell_width for i in range(n_steps + 1)]
+
+    # If the last full-width edge has not reached the minimum, append the exact minimum.
+    # If it is only numerically close to the minimum, force it to the exact minimum.
+    if edges[-1] > min_score + eps:
+        edges.append(min_score)
+    else:
+        edges[-1] = min_score
 
     rows = []
     for i in range(len(edges) - 1):
-        upper = round(float(edges[i]), 6)
-        lower = round(float(edges[i + 1]), 6)
-        rows.append({"cell_id": i + 1, "upper": upper, "lower": lower, "mid": (upper + lower) / 2})
+        upper = float(edges[i])
+        lower = float(edges[i + 1])
+        rows.append({"cell_id": i + 1, "upper": upper, "lower": lower, "mid": (upper + lower) / 2.0})
     return pd.DataFrame(rows)
 
 
+def round_for_cell_assignment(x, digits=3):
+    """Round only for assigning scores to cells; do not use for GEOMEAN/quartiles."""
+    return float(np.round(float(x), digits))
+
+
+def locate_cell_index_for_assignment(cells, value, digits=3):
+    """
+    Locate the central-score cell.
+
+    The central score itself may be rounded to 3 decimals to match the Excel
+    anchor shown in the sheet. Cell boundaries remain the actual grid values.
+    Boundary rule follows Excel COUNTIFS: value == boundary goes to the lower cell.
+    """
+    if len(cells) == 0:
+        return None
+
+    v = round_for_cell_assignment(value, digits)
+    cells_reset = cells.reset_index(drop=True)
+
+    for idx, row in cells_reset.iterrows():
+        upper = float(row["upper"])
+        lower = float(row["lower"])
+        is_bottom = idx == len(cells_reset) - 1
+
+        if is_bottom:
+            ok = (v <= upper) and (v >= lower)
+        else:
+            ok = (v <= upper) and (v > lower)
+
+        if ok:
+            return int(idx)
+
+    mids = cells_reset["mid"].astype(float)
+    return int((mids - v).abs().idxmin())
+
+
 def count_students_in_cells(df, cells, score_col="score_4"):
+    """
+    Count students in cells using Excel COUNTIFS-style logic.
+
+    This matches the worksheet formula:
+        COUNTIFS(score_range, "<=" & upper, score_range, ">" & lower)
+
+    Important:
+    - Raw scores are NOT rounded before counting.
+    - Cell boundaries are generated by the 0.025 grid.
+    - A score exactly equal to a boundary belongs to the LOWER cell,
+      because the upper condition of the lower cell is <= boundary,
+      while the upper cell uses > lower.
+    """
     cells = cells.copy()
+    scores = pd.to_numeric(df[score_col], errors="coerce")
     counts = []
     ids_in_cell = []
 
-    for _, row in cells.iterrows():
-        upper = row["upper"]
-        lower = row["lower"]
-        # Include upper endpoint for top cell; otherwise avoid double count.
-        if row["cell_id"] == 1:
-            mask = (df[score_col] <= upper) & (df[score_col] >= lower)
+    cells_reset = cells.reset_index(drop=True)
+    for idx, row in cells_reset.iterrows():
+        upper = float(row["upper"])
+        lower = float(row["lower"])
+        is_bottom = idx == len(cells_reset) - 1
+
+        if is_bottom:
+            # Last visible cell includes the lower end of the selected grid.
+            mask = (scores <= upper) & (scores >= lower)
         else:
-            mask = (df[score_col] < upper) & (df[score_col] >= lower)
+            # Excel COUNTIFS behavior: <= upper and > lower.
+            mask = (scores <= upper) & (scores > lower)
+
         sub = df[mask]
         counts.append(len(sub))
         ids_in_cell.append(", ".join(sub["student_id"].astype(str).tolist()))
@@ -723,11 +829,8 @@ def build_mean_centered_cell_grades(cells, mean_score, grade_labels, cell_counts
     out["assigned_grade"] = ""
 
     # Find mean cell.
-    mean_candidates = out[(out["upper"] >= mean_score) & (out["lower"] <= mean_score)]
-    if mean_candidates.empty:
-        mean_cell_id = int((out["mid"] - mean_score).abs().idxmin()) + 1
-    else:
-        mean_cell_id = int(mean_candidates.iloc[0]["cell_id"])
+    mean_idx_tmp = locate_cell_index_for_assignment(out, mean_score)
+    mean_cell_id = int(mean_idx_tmp + 1) if mean_idx_tmp is not None else None
 
     # Simple and robust version: assign from high score down using cell counts.
     start_idx = 0
@@ -769,11 +872,9 @@ def build_mean_anchored_cell_grades(cells, mean_score, grade_labels, cell_counts
     if n_cells == 0 or n_grades == 0:
         return out, None
 
-    mean_candidates = out[(out["upper"] >= mean_score) & (out["lower"] <= mean_score)]
-    if mean_candidates.empty:
-        mean_idx = int((out["mid"] - mean_score).abs().idxmin())
-    else:
-        mean_idx = int(mean_candidates.index[0])
+    mean_idx = locate_cell_index_for_assignment(out, mean_score)
+    if mean_idx is None:
+        mean_idx = 0
 
     def count_for(g):
         return max(1, int(cell_counts_by_grade.get(g, 1)))
@@ -855,6 +956,153 @@ def build_mean_anchored_cell_grades(cells, mean_score, grade_labels, cell_counts
 
     return out, int(mean_idx + 1)
 
+
+def build_mean_cell_width_grades(cells, mean_score, grade_labels, cells_per_grade=15, include_mean_cell_in_upper=True):
+    """
+    Excel-style central-score cell-width method with spreadsheet-like one-step rim extension.
+
+    Core logic:
+    1) Discretize the selected min-max range into score cells.
+    2) Find the cell containing the central score, normally Excel GEOMEAN.
+    3) Assign the user-selected core grades around that central cell.
+    4) If cells remain beyond the selected lower/upper grade range, append only
+       one next-lower grade at the lower rim, matching the Excel sheet.
+
+    Example:
+    - Selected core grades = A, B+, B, C+
+    - If lower cells remain after C+, they become C only.
+    """
+    out = cells.copy().reset_index(drop=True)
+    out["assigned_grade"] = ""
+    n_cells = len(out)
+    n_grades = len(grade_labels)
+
+    if n_cells == 0 or n_grades == 0:
+        return out, None
+
+    mean_idx = locate_cell_index_for_assignment(out, mean_score)
+    if mean_idx is None:
+        mean_idx = 0
+
+    step = max(1, int(cells_per_grade))
+
+    if n_grades % 2 == 0:
+        lower_mid_gi = n_grades // 2
+        upper_mid_gi = lower_mid_gi - 1
+
+        # include_mean_cell_in_upper=True means the central-score cell belongs
+        # to the upper-middle grade. This usually matches the spreadsheet layout.
+        boundary_idx = mean_idx + 1 if include_mean_cell_in_upper else mean_idx
+
+        upper_cursor = boundary_idx - 1
+        for gi in range(upper_mid_gi, -1, -1):
+            grade = grade_labels[gi]
+            s = max(0, upper_cursor - step + 1)
+            if upper_cursor >= 0:
+                out.loc[s:upper_cursor, "assigned_grade"] = grade
+            upper_cursor = s - 1
+
+        lower_cursor = boundary_idx
+        for gi in range(lower_mid_gi, n_grades):
+            grade = grade_labels[gi]
+            e = min(n_cells - 1, lower_cursor + step - 1)
+            if lower_cursor < n_cells:
+                out.loc[lower_cursor:e, "assigned_grade"] = grade
+            lower_cursor = e + 1
+
+    else:
+        mid_gi = n_grades // 2
+
+        # Odd number of selected grades: Excel-style middle-band placement.
+        #
+        # Key detail checked from the Excel sheet:
+        # Scheme 2 has 5 grades and 12 cells per grade. The central score
+        # is on/near cell 27, and the middle grade B occupies cells 22–33.
+        # That means for an EVEN step size, the central cell sits slightly
+        # above the mathematical center of the middle band:
+        #   cells above = step//2 - 1
+        #   cells below = step//2
+        #
+        # This avoids a one-cell upward shift that makes A too small and B+
+        # too large. We use mean_idx directly instead of continuous geometry
+        # because Excel operates by cell index after the central score is
+        # located in the score-cell table.
+        if step % 2 == 0:
+            cells_above = max(0, step // 2 - 1)
+        else:
+            cells_above = step // 2
+
+        start = mean_idx - cells_above
+        start = max(0, min(n_cells - 1, start))
+        end = min(n_cells - 1, start + step - 1)
+
+        # If clipping at the bottom shortens the middle band, shift upward.
+        if (end - start + 1) < step and start > 0:
+            start = max(0, end - step + 1)
+
+        out.loc[start:end, "assigned_grade"] = grade_labels[mid_gi]
+
+        upper_cursor = start - 1
+        for gi in range(mid_gi - 1, -1, -1):
+            grade = grade_labels[gi]
+            s = max(0, upper_cursor - step + 1)
+            if upper_cursor >= 0:
+                out.loc[s:upper_cursor, "assigned_grade"] = grade
+            upper_cursor = s - 1
+
+        lower_cursor = end + 1
+        for gi in range(mid_gi + 1, n_grades):
+            grade = grade_labels[gi]
+            e = min(n_cells - 1, lower_cursor + step - 1)
+            if lower_cursor < n_cells:
+                out.loc[lower_cursor:e, "assigned_grade"] = grade
+            lower_cursor = e + 1
+
+    # ---------------------------------------------------------
+    # Excel-like rim extension.
+    #
+    # The spreadsheet does NOT recursively create multiple rim grades
+    # by step-size blocks. It first preserves the fixed core bands,
+    # then uses only one rim grade for all remaining cells.
+    #
+    # Examples:
+    # - Core A/B+/B/C+  -> lower rim becomes C
+    # - Core A/B+/B/C+/C -> lower rim becomes D+
+    # - Core A/B+/B/C+/C/D+ -> lower rim becomes D
+    #
+    # Upper unused cells are kept as the highest selected grade.
+    # This matches the ตัดGrade sheet summary behavior:
+    # Scheme 1 = A 11, B+ 26, B 11, C+ 8, C 2
+    # Scheme 2 = A 7, B+ 24, B 13, C+ 4, C 8, D+ 2
+    # ---------------------------------------------------------
+    official = DEFAULT_GRADES_8
+
+    def next_lower_grade(g):
+        if g not in official:
+            return g
+        i = official.index(g)
+        return official[min(len(official) - 1, i + 1)]
+
+    assigned_idx = out.index[out["assigned_grade"] != ""].tolist()
+    if not assigned_idx:
+        out["assigned_grade"] = grade_labels[-1]
+        return out, int(mean_idx + 1)
+
+    first_assigned = min(assigned_idx)
+    last_assigned = max(assigned_idx)
+
+    # Upper rim: preserve the highest selected/core grade, not recursive expansion.
+    if first_assigned > 0:
+        out.loc[:first_assigned - 1, "assigned_grade"] = out.loc[first_assigned, "assigned_grade"]
+
+    # Lower rim: append only the next lower official grade for all remaining cells.
+    # Do not cascade into D+/D/F unless those grades are already part of the core.
+    if last_assigned < n_cells - 1:
+        bottom_core = out.loc[last_assigned, "assigned_grade"]
+        out.loc[last_assigned + 1:, "assigned_grade"] = next_lower_grade(bottom_core)
+
+    return out, int(mean_idx + 1)
+
 def build_manual_boundary_cell_grades(cells, boundary_table):
     """
     Boundary table:
@@ -868,19 +1116,37 @@ def build_manual_boundary_cell_grades(cells, boundary_table):
 
 
 def grade_from_cells(df, cells_with_grades, scheme_name):
+    """
+    Assign grades using the same logic as Excel COUNTIFS:
+        score <= upper and score > lower
+
+    Raw student scores are NOT rounded. This is important because a score such
+    as 3.725384 should remain above the 3.725 boundary and stay in the upper
+    cell, exactly as in Excel.
+    """
     out = df.copy()
 
     def assign_cell_grade(score):
-        for _, row in cells_with_grades.iterrows():
-            upper = row["upper"]
-            lower = row["lower"]
-            if row["cell_id"] == 1:
+        score = float(score)
+        cells_reset = cells_with_grades.reset_index(drop=True)
+
+        for idx, row in cells_reset.iterrows():
+            upper = float(row["upper"])
+            lower = float(row["lower"])
+            is_bottom = idx == len(cells_reset) - 1
+
+            if is_bottom:
                 ok = (score <= upper) and (score >= lower)
             else:
-                ok = (score < upper) and (score >= lower)
+                ok = (score <= upper) and (score > lower)
+
             if ok:
                 return row["assigned_grade"]
-        return cells_with_grades.iloc[-1]["assigned_grade"]
+
+        # Values outside the selected min/max receive nearest rim grade.
+        if score > float(cells_reset.iloc[0]["upper"]):
+            return cells_reset.iloc[0]["assigned_grade"]
+        return cells_reset.iloc[-1]["assigned_grade"]
 
     out[f"grade_qrange_{scheme_name}"] = out["score_4"].apply(assign_cell_grade)
     return out[["student_id", f"grade_qrange_{scheme_name}"]]
@@ -889,7 +1155,7 @@ def grade_from_cells(df, cells_with_grades, scheme_name):
 def quantile_cell_plot(cells, mean_score=None, q1=None, q2=None, q3=None, title="Quantile-range cells"):
     plot_df = cells.copy()
     plot_df["label"] = plot_df.apply(
-        lambda r: f"{r['upper']:.3f} – {r['lower']:.3f}<br>Count: {r['count']}<br>Grade: {r.get('assigned_grade', '')}",
+        lambda r: f"{r['upper']:.4f} – {r['lower']:.4f}<br>Count: {r['count']}<br>Grade: {r.get('assigned_grade', '')}",
         axis=1,
     )
 
@@ -907,7 +1173,7 @@ def quantile_cell_plot(cells, mean_score=None, q1=None, q2=None, q3=None, title=
     fig.update_xaxes(title="Number of students")
 
     if mean_score is not None:
-        fig.add_hline(y=mean_score, line_dash="solid", annotation_text="Mean", annotation_position="right")
+        fig.add_hline(y=mean_score, line_dash="solid", annotation_text="Central (GEOMEAN)", annotation_position="right")
     if q1 is not None:
         fig.add_hline(y=q1, line_dash="dot", annotation_text="Q1", annotation_position="left")
     if q2 is not None:
@@ -923,17 +1189,34 @@ def quantile_cell_plot(cells, mean_score=None, q1=None, q2=None, q3=None, title=
 # =========================================================
 
 def kmeans_grading(df_all, df_calc, scheme_name, k, grade_labels, random_state=42):
+    """
+    K-means grading with Excel-like excluded-outlier handling.
+
+    K-means is fitted only on df_calc. Students excluded from df_calc but still
+    shown in df_all are handled as follows:
+    - upper-end excluded students, score > max(df_calc), are assigned to A / top grade
+    - lower-end excluded students, score < min(df_calc), are assigned to one grade
+      lower than the lowest selected K-means grade
+      e.g. A/B+/B/C+ -> lower outliers become C
+           A/B+/B/C+/C -> lower outliers become D+
+    - excluded students inside the fitted range keep the predicted K-means grade
+    """
     out = df_all.copy()
 
+    cluster_col = f"cluster_kmeans_{scheme_name}"
+    grade_col = f"grade_kmeans_{scheme_name}"
+    note_col = f"kmeans_note_{scheme_name}"
+
     if len(df_calc) < k or k <= 0:
-        out[f"cluster_kmeans_{scheme_name}"] = np.nan
-        out[f"grade_kmeans_{scheme_name}"] = "-"
-        return out[["student_id", f"cluster_kmeans_{scheme_name}", f"grade_kmeans_{scheme_name}"]], None, np.nan
+        out[cluster_col] = np.nan
+        out[grade_col] = "-"
+        out[note_col] = "not enough calculation data"
+        return out[["student_id", cluster_col, grade_col, note_col]], None, np.nan
 
     model = KMeans(n_clusters=k, random_state=random_state, n_init=10)
     model.fit(df_calc[["score_4"]])
 
-    out[f"cluster_kmeans_{scheme_name}"] = model.predict(out[["score_4"]])
+    out[cluster_col] = model.predict(out[["score_4"]])
 
     center_df = pd.DataFrame({
         "cluster": range(k),
@@ -941,10 +1224,41 @@ def kmeans_grading(df_all, df_calc, scheme_name, k, grade_labels, random_state=4
     }).sort_values("center", ascending=False).reset_index(drop=True)
 
     cluster_to_grade = {int(row["cluster"]): grade_labels[i] for i, row in center_df.iterrows()}
-    out[f"grade_kmeans_{scheme_name}"] = out[f"cluster_kmeans_{scheme_name}"].map(cluster_to_grade)
+    out[grade_col] = out[cluster_col].map(cluster_to_grade)
+    out[note_col] = "k-means prediction"
+
+    official = DEFAULT_GRADES_8
+
+    def next_lower_grade(g):
+        if g not in official:
+            return g
+        i = official.index(g)
+        return official[min(len(official) - 1, i + 1)]
+
+    calc_ids = set(df_calc["student_id"].astype(str))
+    out["_excluded_from_kmeans_fit"] = ~out["student_id"].astype(str).isin(calc_ids)
+
+    calc_min = float(df_calc["score_4"].min())
+    calc_max = float(df_calc["score_4"].max())
+
+    top_grade = grade_labels[0] if len(grade_labels) else "A"
+    bottom_grade = grade_labels[-1] if len(grade_labels) else "-"
+    lower_outlier_grade = next_lower_grade(bottom_grade)
+
+    upper_mask = out["_excluded_from_kmeans_fit"] & (out["score_4"] > calc_max)
+    lower_mask = out["_excluded_from_kmeans_fit"] & (out["score_4"] < calc_min)
+
+    out.loc[upper_mask, grade_col] = top_grade
+    out.loc[upper_mask, note_col] = "excluded upper-end outlier -> top grade"
+
+    out.loc[lower_mask, grade_col] = lower_outlier_grade
+    out.loc[lower_mask, note_col] = f"excluded lower-end outlier -> one lower than {bottom_grade}"
+
+    inside_excluded = out["_excluded_from_kmeans_fit"] & ~(upper_mask | lower_mask)
+    out.loc[inside_excluded, note_col] = "excluded from fit but inside fitted range -> predicted grade"
 
     summary = (
-        out.groupby(f"grade_kmeans_{scheme_name}")
+        out.groupby(grade_col)
         .agg(
             students=("student_id", "count"),
             min_score=("score_4", "min"),
@@ -952,8 +1266,12 @@ def kmeans_grading(df_all, df_calc, scheme_name, k, grade_labels, random_state=4
             mean_score=("score_4", "mean"),
         )
         .reset_index()
-        .rename(columns={f"grade_kmeans_{scheme_name}": "grade"})
+        .rename(columns={grade_col: "grade"})
     )
+
+    # Keep summary in official grade order.
+    summary["_order"] = summary["grade"].map(GRADE_ORDER).fillna(99)
+    summary = summary.sort_values("_order").drop(columns="_order").reset_index(drop=True)
 
     sil = np.nan
     if k > 1 and len(df_calc) > k:
@@ -963,7 +1281,7 @@ def kmeans_grading(df_all, df_calc, scheme_name, k, grade_labels, random_state=4
         except Exception:
             sil = np.nan
 
-    return out[["student_id", f"cluster_kmeans_{scheme_name}", f"grade_kmeans_{scheme_name}"]], summary, sil
+    return out[["student_id", cluster_col, grade_col, note_col]], summary, sil
 
 
 # =========================================================
@@ -975,6 +1293,9 @@ if "result_tables" not in st.session_state:
 
 if "scheme_meta" not in st.session_state:
     st.session_state.scheme_meta = []
+
+if "latest_grade_col" not in st.session_state:
+    st.session_state.latest_grade_col = None
 
 
 # =========================================================
@@ -1052,12 +1373,14 @@ st.subheader("Dataset overview")
 c1, c2, c3, c4, c5, c6 = st.columns(6)
 c1.metric("Students", len(base_df))
 c2.metric("Calc. students", len(calc_df))
-c3.metric("Mean", f"{calc_df['score_4'].mean():.3f}")
-c4.metric("Median", f"{calc_df['score_4'].median():.3f}")
-c5.metric("Std", f"{calc_df['score_4'].std(ddof=0):.3f}")
+central_score_raw = excel_geomean(calc_df["score_4"])
+central_score = round_for_cell_assignment(central_score_raw, 3)
+c3.metric("Central (GEOMEAN)", f"{central_score:.3f}")
+c4.metric("Median", f"{calc_df['score_4'].median():.4f}")
+c5.metric("Std", f"{calc_df['score_4'].std(ddof=0):.4f}")
 c6.metric("Outliers", int(base_df["outlier_any"].sum()))
 
-st.plotly_chart(distribution_plot(base_df, title="0–4 score distribution with outliers and quantiles"), use_container_width=True)
+st.plotly_chart(distribution_plot(base_df, title="0–4 score distribution with outliers and Excel quartiles"), use_container_width=True)
 
 with st.expander("คำแนะนำสำหรับการใช้ในที่ประชุมอาจารย์ / Faculty review guide", expanded=True):
     st.markdown(
@@ -1071,7 +1394,7 @@ with st.expander("คำแนะนำสำหรับการใช้ใ�
         """
     )
 
-with st.expander("Outlier and quantile details", expanded=False):
+with st.expander("Outlier and Excel quartile details", expanded=False):
     q_df = pd.DataFrame([outlier_info]).T.reset_index()
     q_df.columns = ["Metric", "Value"]
     st.dataframe(q_df, use_container_width=True)
@@ -1141,6 +1464,7 @@ with tab_z:
         z_grade_col = f"grade_z_{z_scheme_name}"
 
         st.session_state.result_tables[z_grade_col] = z_res
+        st.session_state.latest_grade_col = z_grade_col
         if not any(m["column"] == z_grade_col for m in st.session_state.scheme_meta):
             st.session_state.scheme_meta.append({"mode": "Z-score", "scheme": z_scheme_name, "column": z_grade_col})
 
@@ -1201,7 +1525,7 @@ with tab_range:
                     min_value=0.0,
                     max_value=4.0,
                     step=0.025,
-                    format="%.3f",
+                    format="%.4f",
                     key=f"r_cut_{r_scheme_name}_{grade}",
                 )
             r_thresholds.append((grade, cutoff))
@@ -1211,6 +1535,7 @@ with tab_range:
         r_grade_col = f"grade_range_{r_scheme_name}"
 
         st.session_state.result_tables[r_grade_col] = r_res
+        st.session_state.latest_grade_col = r_grade_col
         if not any(m["column"] == r_grade_col for m in st.session_state.scheme_meta):
             st.session_state.scheme_meta.append({"mode": "Simple range", "scheme": r_scheme_name, "column": r_grade_col})
 
@@ -1246,21 +1571,68 @@ with tab_qrange:
     q_scheme_name = st.text_input("Quantile-range scheme name", value="QR1", key="q_scheme_name")
 
     q_col1, q_col2, q_col3 = st.columns(3)
-    cell_width = q_col1.number_input("Cell width", value=0.025, min_value=0.005, max_value=0.500, step=0.005, format="%.3f")
-    assignment_mode = q_col2.radio("Assignment mode", ["Cell counts from top", "Cell counts from mean", "Manual cutoffs"], index=0)
+    cell_width = q_col1.number_input("Cell width", value=0.025, min_value=0.005, max_value=0.500, step=0.005, format="%.4f")
+    assignment_mode = q_col2.radio(
+        "Assignment mode",
+        [
+            "Cell counts from top",
+            "Cell counts from mean",
+            "Central-score cell width mode",
+            "Manual cutoffs",
+        ],
+        index=0,
+    )
     q_use_calc = q_col3.radio("Cell count source", ["All students", "Calculation set"], index=0)
 
     q_count_df = base_df if q_use_calc == "All students" else calc_df
 
-    cells = make_score_cells(cell_width=cell_width, min_score=0.0, max_score=4.0)
+    range_col1, range_col2, range_col3 = st.columns(3)
+    q_range_mode = range_col1.radio(
+        "Cell min/max source",
+        ["0–4 scale", "Observed min/max", "Custom min/max"],
+        index=0,
+        horizontal=True,
+    )
+
+    observed_min = float(q_count_df["score_4"].min())
+    observed_max = float(q_count_df["score_4"].max())
+
+    if q_range_mode == "0–4 scale":
+        cell_min_score, cell_max_score = 0.0, 4.0
+    elif q_range_mode == "Observed min/max":
+        cell_min_score, cell_max_score = observed_min, observed_max
+    else:
+        cell_min_score = range_col2.number_input(
+            "Custom cell minimum",
+            value=max(0.0, math.floor(observed_min / cell_width) * cell_width),
+            min_value=0.0,
+            max_value=4.0,
+            step=cell_width,
+            format="%.4f",
+        )
+        cell_max_score = range_col3.number_input(
+            "Custom cell maximum",
+            value=min(4.0, math.ceil(observed_max / cell_width) * cell_width),
+            min_value=0.0,
+            max_value=4.0,
+            step=cell_width,
+            format="%.4f",
+        )
+
+    if cell_max_score <= cell_min_score:
+        st.error("Cell maximum must be greater than cell minimum.")
+        st.stop()
+
+    cells = make_score_cells(cell_width=cell_width, min_score=cell_min_score, max_score=cell_max_score)
     cells = count_students_in_cells(q_count_df, cells, score_col="score_4")
 
-    mean_score = calc_df["score_4"].mean()
-    q1 = calc_df["score_4"].quantile(0.25)
-    q2 = calc_df["score_4"].quantile(0.50)
-    q3 = calc_df["score_4"].quantile(0.75)
+    mean_score_raw = excel_geomean(calc_df["score_4"])
+    mean_score = round_for_cell_assignment(mean_score_raw, 3)
+    q1 = excel_quartile_exc(calc_df["score_4"], 1)
+    q2 = excel_quartile_exc(calc_df["score_4"], 2)
+    q3 = excel_quartile_exc(calc_df["score_4"], 3)
 
-    st.write(f"Mean = **{mean_score:.3f}**, Q1 = **{q1:.3f}**, Q2 = **{q2:.3f}**, Q3 = **{q3:.3f}**")
+    st.write(f"Central score (Excel GEOMEAN, rounded anchor) = **{mean_score:.3f}**, Q1/Q2/Q3 (Excel QUARTILE.EXC) = **{q1:.4f}**, **{q2:.4f}**, **{q3:.4f}**")
 
     if assignment_mode == "Cell counts from top":
         st.write("Define how many sub-range cells each grade occupies from top score downward.")
@@ -1303,13 +1675,14 @@ with tab_qrange:
                 cell_counts_by_grade=count_inputs,
             )
 
-            st.caption(f"Mean is located around cell ID: {mean_cell_id}")
+            st.caption(f"Central score is located around cell ID: {mean_cell_id}")
 
             q_res = grade_from_cells(base_df, cells_assigned, q_scheme_name)
             q_full = base_df.merge(q_res, on="student_id", how="left")
             q_grade_col = f"grade_qrange_{q_scheme_name}"
 
             st.session_state.result_tables[q_grade_col] = q_res
+            st.session_state.latest_grade_col = q_grade_col
             if not any(m["column"] == q_grade_col for m in st.session_state.scheme_meta):
                 st.session_state.scheme_meta.append({"mode": "Quantile-range", "scheme": q_scheme_name, "column": q_grade_col})
 
@@ -1375,13 +1748,80 @@ with tab_qrange:
                 cell_counts_by_grade=count_inputs,
             )
 
-            st.caption(f"Mean is located around cell ID: {mean_cell_id}")
+            st.caption(f"Central score is located around cell ID: {mean_cell_id}")
 
             q_res = grade_from_cells(base_df, cells_assigned, q_scheme_name)
             q_full = base_df.merge(q_res, on="student_id", how="left")
             q_grade_col = f"grade_qrange_{q_scheme_name}"
 
             st.session_state.result_tables[q_grade_col] = q_res
+            st.session_state.latest_grade_col = q_grade_col
+            if not any(m["column"] == q_grade_col for m in st.session_state.scheme_meta):
+                st.session_state.scheme_meta.append({"mode": "Quantile-range", "scheme": q_scheme_name, "column": q_grade_col})
+
+            show_grade_review_panel(q_full, q_grade_col, title_prefix=f"Quantile-range {q_scheme_name}: ")
+            show_supporting_visuals(
+                q_full,
+                q_grade_col,
+                title_prefix=f"Quantile-range {q_scheme_name}: ",
+                main_fig=quantile_cell_plot(cells_assigned, mean_score=mean_score, q1=q1, q2=q2, q3=q3, title=f"Quantile-range cells: {q_scheme_name}"),
+            )
+            show_bottom_check_tables(
+                q_full,
+                q_grade_col,
+                summary_df=grade_distribution_ordered(q_full, q_grade_col),
+                summary_title="Grade distribution table",
+                table_title="Student checking table — Quantile-range result",
+            )
+            with st.expander("Cell table — detailed score cells", expanded=False):
+                st.dataframe(cells_assigned, use_container_width=True, height=500)
+
+    elif assignment_mode == "Central-score cell width mode":
+        st.write("Discretize the selected min-max range, find the cell containing the central score, then move grade boundaries upward/downward by a fixed number of cells. If cells remain after the selected grades are used, the app automatically adds lower/upper rim grades from the official grade ladder.")
+        q_grades = st.multiselect("Grades", DEFAULT_GRADES_8, default=DEFAULT_GRADES_4, key="q_grades_mean_width")
+
+        if len(q_grades) < 2:
+            st.warning("Select at least two grades.")
+        else:
+            mean_width_cols = st.columns(3)
+            cells_per_grade = mean_width_cols[0].number_input(
+                "Cells per grade step",
+                value=15,
+                min_value=1,
+                max_value=len(cells),
+                step=1,
+                key=f"q_mean_width_cells_{q_scheme_name}",
+            )
+            include_mean_cell = mean_width_cols[1].checkbox(
+                "Include mean cell in upper-middle grade",
+                value=True,
+                key=f"q_mean_width_include_{q_scheme_name}",
+            )
+
+            if len(q_grades) % 2 == 0:
+                upper_middle = q_grades[len(q_grades) // 2 - 1]
+                lower_middle = q_grades[len(q_grades) // 2]
+                st.caption(f"Central-cell anchor: boundary between {upper_middle} and {lower_middle}; each grade step = {cells_per_grade} cells.")
+            else:
+                middle_grade = q_grades[len(q_grades) // 2]
+                st.caption(f"Central-cell anchor: {middle_grade} is centered on the mean cell; each grade step = {cells_per_grade} cells.")
+
+            cells_assigned, mean_cell_id = build_mean_cell_width_grades(
+                cells,
+                mean_score=mean_score,
+                grade_labels=q_grades,
+                cells_per_grade=cells_per_grade,
+                include_mean_cell_in_upper=include_mean_cell,
+            )
+
+            st.caption(f"Central score is located around cell ID: {mean_cell_id}")
+
+            q_res = grade_from_cells(base_df, cells_assigned, q_scheme_name)
+            q_full = base_df.merge(q_res, on="student_id", how="left")
+            q_grade_col = f"grade_qrange_{q_scheme_name}"
+
+            st.session_state.result_tables[q_grade_col] = q_res
+            st.session_state.latest_grade_col = q_grade_col
             if not any(m["column"] == q_grade_col for m in st.session_state.scheme_meta):
                 st.session_state.scheme_meta.append({"mode": "Quantile-range", "scheme": q_scheme_name, "column": q_grade_col})
 
@@ -1433,7 +1873,7 @@ with tab_qrange:
                         min_value=0.0,
                         max_value=4.0,
                         step=cell_width,
-                        format="%.3f",
+                        format="%.4f",
                         key=f"q_manual_{q_scheme_name}_{grade}",
                     )
                 rows.append({"grade": grade, "cutoff": cutoff})
@@ -1446,6 +1886,7 @@ with tab_qrange:
             q_grade_col = f"grade_qrange_{q_scheme_name}"
 
             st.session_state.result_tables[q_grade_col] = q_res
+            st.session_state.latest_grade_col = q_grade_col
             if not any(m["column"] == q_grade_col for m in st.session_state.scheme_meta):
                 st.session_state.scheme_meta.append({"mode": "Quantile-range", "scheme": q_scheme_name, "column": q_grade_col})
 
@@ -1473,7 +1914,7 @@ with tab_qrange:
 
 with tab_kmeans:
     st.subheader("K-means grading")
-    st.write("Scores are clustered first. Clusters are then ordered from highest to lowest score and mapped to grade labels.")
+    st.write("Scores are clustered first using the calculation set. If outliers are excluded from fitting, upper-end excluded students are assigned to the top grade, while lower-end excluded students are assigned to one grade lower than the lowest selected grade.")
     st.info("ภาษาไทย: K-means ใช้ดูว่าคะแนนแบ่งเป็นกลุ่มธรรมชาติอย่างไร เหมาะเป็นภาพประกอบการตัดสินใจ แต่ควรตรวจสอบด้วยสายตาและบริบทของรายวิชาเสมอ")
 
     k_scheme_name = st.text_input("K-means scheme name", value="K1", key="k_scheme_name")
@@ -1505,6 +1946,7 @@ with tab_kmeans:
         k_grade_col = f"grade_kmeans_{k_scheme_name}"
 
         st.session_state.result_tables[k_grade_col] = k_res
+        st.session_state.latest_grade_col = k_grade_col
         if not any(m["column"] == k_grade_col for m in st.session_state.scheme_meta):
             st.session_state.scheme_meta.append({"mode": "K-means", "scheme": k_scheme_name, "column": k_grade_col})
 
@@ -1547,7 +1989,17 @@ with tab_compare:
         st.write("Available schemes")
         st.dataframe(pd.DataFrame(st.session_state.scheme_meta), use_container_width=True)
 
-        final_grade_col = st.selectbox("Select final grade column for official export", grade_cols)
+        preferred_final = st.session_state.get("latest_grade_col")
+        if preferred_final not in grade_cols:
+            preferred_final = st.session_state.get("final_grade_col")
+        default_index = grade_cols.index(preferred_final) if preferred_final in grade_cols else len(grade_cols) - 1
+
+        final_grade_col = st.selectbox(
+            "Select final grade column for official export",
+            grade_cols,
+            index=default_index,
+            key="final_grade_col",
+        )
         comparison["final_selected_grade"] = comparison[final_grade_col]
         comparison["grade_point"] = comparison["final_selected_grade"].map(GRADE_POINTS)
         comparison = add_rank(comparison, score_col="score_4")
